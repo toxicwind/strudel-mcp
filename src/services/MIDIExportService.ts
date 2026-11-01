@@ -45,6 +45,13 @@ export interface MIDIExportOptions {
   bpm?: number;
   /** Duration in bars to export (default: 4) */
   bars?: number;
+  /**
+   * Original strudel source to embed losslessly so `Ableton -> strudel`
+   * recovers the exact code. tonejs/midi exposes no text-meta field, so the
+   * code is base64-encoded into the track name after a `murk:` marker (track
+   * names survive MIDI -> Ableton -> MIDI verbatim). Set to null to omit.
+   */
+  code?: string | null;
   /** MIDI track name (default: 'Strudel Pattern') */
   trackName?: string;
   /** Time signature numerator (default: 4) */
@@ -1021,6 +1028,7 @@ export class MIDIExportService {
       bpm = 120,
       bars = 4,
       trackName = 'Strudel Pattern',
+      code = null,
       timeSignatureNumerator = 4,
       timeSignatureDenominator = 4
     } = options;
@@ -1070,6 +1078,14 @@ export class MIDIExportService {
     // Keep a melodic track first even for a drums-only export, so the
     // file shape does not change depending on content.
     trackFor(0);
+
+    // No-loss round-trip carrier: embed the original strudel source as
+    // `murk:<base64>` in the first melodic track name. Track names are the one
+    // free-text field tonejs/midi round-trips untouched, so the code survives
+    // Ableton export/import losslessly and is recovered by `codeFromMidi`.
+    if (typeof code === 'string' && code.length > 0) {
+      trackFor(0).name = `murk:${Buffer.from(code, 'utf8').toString('base64')}`;
+    }
 
     let written = 0;
     notes.forEach(noteEvent => {
@@ -1295,6 +1311,25 @@ export class MIDIExportService {
         bpm: options.bpm || 120,
         error: `MIDI export failed: ${error.message}`
       };
+    }
+  }
+
+  /**
+   * No-loss round-trip decoder: recover the original strudel source embedded
+   * by `convertToMidi` as `murk:<base64>` in the first melodic track name.
+   * Complements the `code?` export option so `Ableton -> strudel` restores the
+   * exact code (INTENT R1). Returns null when no carrier track is present.
+   */
+  static codeFromMidi(midi: { tracks: Array<{ name?: string }> }): string | null {
+    const names = midi.tracks
+      .map((t) => t.name ?? '')
+      .filter((n) => n.startsWith('murk:'));
+    if (names.length === 0) return null;
+    const b64 = names[0].slice('murk:'.length);
+    try {
+      return Buffer.from(b64, 'base64').toString('utf8');
+    } catch {
+      return null;
     }
   }
 }

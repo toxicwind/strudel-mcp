@@ -13,8 +13,22 @@ speaks to BOTH the DAW world and the livecoding world.
 
 ## The target (highly intentional)
 
+### ★ Main feature — bidirectional strudel ↔ Ableton, no loss
+
+Anything created in one side must survive round-trip into the other and back
+with **zero loss** (code, notes, fx values, session state). Chosen stack and
+the "no-loss = code embedded in the carrier" contract are in
+`INTENT_RESEARCH_20261101T163721.md` (Live Extensions SDK + strudel-live-style
+code-in-WAV + MIDI baking + Ableton Link). This is the feature everything else
+exists to serve.
+
+---
+
+### Supporting target — cross-platform, Ableton + Strudel as co-equal mains
+
 Make fathom-mcp the cross-platform music-production MCP with **Ableton and
-Strudel as co-equal mains**, and VSTi support:
+Strudel as co-equal mains**, VSTi support, and the bidirectional no-loss round
+trip (above) as the headline capability:
 
 | Axis | Target |
 |------|--------|
@@ -38,14 +52,17 @@ Strudel as co-equal mains**, and VSTi support:
 ## Task list (the height of ambition)
 
 1. **Preserve 100% of upstream** (28 tools + tests) — DONE.
-2. **Cross-OS**: verify/parametrize every browser + engine path by
+2. **Bidirectional no-loss round-trip** (THE main feature): strudel→Ableton
+   and Ableton→strudel with code/params/session surviving both directions —
+   see research doc; adopt `strudelton`/`strudel-live` approach (code-in-WAV).
+3. **Cross-OS**: verify/parametrize every browser + engine path by
    `process.platform` (win32/darwin/linux); no hardcoded Unix-isms.
-3. **Ableton main**: add Ableton Live session/clip/track/export tools
+4. **Ableton main**: add Ableton Live session/clip/track/export tools
    (Ableton's MIDI/Link or the Ableton API), cross-platform (win/mac).
-4. **VSTi**: add VSTi rendering tools — host Serum 2 / generic VST3 via the
+5. **VSTi**: add VSTi rendering tools — host Serum 2 / generic VST3 via the
    private abyss/`zygzxg_render` bridge (Linux: no DAW needed, offline render;
    win/mac: DAW or VST3 host).
-5. **Register** in estate Thresher gateway so agents get the tools via MCP.
+6. **Register** in estate Thresher gateway so agents get the tools via MCP.
 
 ## Rules (override ALL prior file docs)
 

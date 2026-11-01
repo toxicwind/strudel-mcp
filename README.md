@@ -1,6 +1,8 @@
-# live-coding-music-mcp
+# fathom-mcp
 
-> 🎵 MCP server for AI-assisted live-coding music via [strudel.cc](https://strudel.cc/)
+> AI music-production MCP server (fork of live-coding-music-mcp) driving the
+> estate's **strudel workbench** (`:8088`) + **sampler** (`:55432`) — bidirectional
+> Ableton ↔ strudel, no loss. See `INTENT.md`.
 >
 > **Unofficial fan project.** Not affiliated with, or endorsed by, the [Strudel project](https://codeberg.org/uzu/strudel). This adapter exists to make live-coding music accessible to beginners who want to try pattern-based music without learning the whole ecosystem first.
 >

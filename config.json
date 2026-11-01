@@ -1,6 +1,7 @@
 {
   "headless": false,
-  "strudel_url": "https://strudel.cc/",
+  "strudel_url": "http://localhost:8088/",
+  "sampler_url": "http://localhost:55432/",
   "patterns_dir": "./patterns",
   "audio_analysis": {
     "fft_size": 2048,

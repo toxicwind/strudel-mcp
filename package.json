@@ -1,11 +1,11 @@
 {
-  "name": "@williamzujkowski/live-coding-music-mcp",
+  "name": "@toxicwind/fathom-mcp",
   "version": "4.1.0",
-  "description": "MCP server (unofficial, fan project) for AI-assisted live-coding music via strudel.cc. Lets Claude drive pattern generation, audio analysis, and MIDI export through the Strudel browser REPL.",
+  "description": "Fathom pen MCP server: AI-assisted live-coding music (fork of live-coding-music-mcp) driving the estate strudel stack.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "live-coding-music-mcp": "dist/index.js"
+    "fathom-mcp": "dist/index.js"
   },
   "files": [
     "dist/",

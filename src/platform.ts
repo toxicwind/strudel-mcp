@@ -21,7 +21,7 @@ export interface FathomPlatform {
   readonly daw: 'ableton' | null
   /** how to reach a VSTi host on this OS */
   readonly vsti: 'ableton-vst3' | 'zygzxg-render' | null
-  /** default strudel target for this OS (estate-local on linux) */
+  /** default strudel target for this OS (Pens-local on linux) */
   readonly strudelUrl: string
   /** artifact dir for rendered audio (per-OS, predictable) */
   readonly artifactDir: string

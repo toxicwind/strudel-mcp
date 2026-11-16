@@ -26,7 +26,7 @@ describe('fathom platform matrix (INTENT.md:2)', () => {
     expect(fathomPlatform.vsti).toBe('serum-vst3')
   })
 
-  it('linux keeps strudel-only + zyg-render VSTi (our estate default)', async () => {
+  it('linux keeps strudel-only + zyg-render VSTi (our Pens default)', async () => {
     const { fathomPlatform } = await loadFor('linux')
     expect(fathomPlatform.platform).toBe('linux')
     expect(fathomPlatform.daw).toBe('strudel')

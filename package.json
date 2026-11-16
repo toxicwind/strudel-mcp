@@ -1,7 +1,7 @@
 {
   "name": "@toxicwind/fathom-mcp",
   "version": "4.1.0",
-  "description": "Fathom pen MCP server: AI-assisted live-coding music (fork of live-coding-music-mcp) driving the estate strudel stack.",
+  "description": "Fathom pen MCP server: AI-assisted live-coding music (fork of live-coding-music-mcp) driving the Pens strudel stack.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

@@ -1,6 +1,6 @@
 # INTENT.md — fathom-mcp (fork of williamzujkowski/live-coding-music-mcp)
 
-**fathom**: the estate's music pen (`pens/fathom`). This MCP server is the fathom
+**fathom**: the Pens's music pen (`pens/fathom`). This MCP server is the fathom
 pen's agent surface: an AI-driven music-production + live-coding brain that
 speaks to BOTH the DAW world and the livecoding world.
 
@@ -40,7 +40,7 @@ trip (above) as the headline capability:
 ## How the existing seam maps (already cross-OS)
 
 - `config.json:strudel_url` drives the strudel target. It already points at the
-  estate-local workbench (`http://localhost:8088`) + sampler (`:55432`) on
+  Pens-local workbench (`http://localhost:8088`) + sampler (`:55432`) on
   Linux. On Windows/macOS the same knob points at that OS's native/headless
   strudel or the OS browser.
 - `StrudelController` launches **Chromium via Playwright** — Playwright's
@@ -62,7 +62,7 @@ trip (above) as the headline capability:
 5. **VSTi**: add VSTi rendering tools — host Serum 2 / generic VST3 via the
    private abyss/`zygzxg_render` bridge (Linux: no DAW needed, offline render;
    win/mac: DAW or VST3 host).
-6. **Register** in estate Thresher gateway so agents get the tools via MCP.
+6. **Register** in Pens Thresher gateway so agents get the tools via MCP.
 
 ## Rules (override ALL prior file docs)
 

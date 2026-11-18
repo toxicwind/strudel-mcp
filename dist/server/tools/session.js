@@ -1,0 +1,147 @@
+/**
+ * session domain — multi-session lifecycle management.
+ *
+ * Owns one consolidated tool (`session(action)`) with create/destroy/
+ * list/switch actions. `init` stays separate — it's the global
+ * bootstrap, not a session operation.
+ */
+import { categorizeError, empty, err, ok } from './types.js';
+import { InputValidator } from '../../utils/InputValidator.js';
+export const tools = [
+    {
+        name: 'session',
+        description: 'Manage isolated Strudel browser sessions (multi-session, #108). ' +
+            'action=create starts a new named session (sessions share one browser but isolated contexts). ' +
+            'action=destroy closes a named session and releases its resources. ' +
+            'action=list returns metadata for all active sessions (id, created, last_activity, is_playing, is_default). ' +
+            'action=switch changes the default session that subsequent tool calls route to when no session_id is passed. ' +
+            'Example: session({ action: "create", session_id: "live-set-1" }). ' +
+            'For the on-disk pattern catalog use pattern_store(action=list) — session(action=list) lists *runtime* sessions, not saved patterns.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                action: { type: 'string', enum: ['create', 'destroy', 'list', 'switch'], description: 'Session lifecycle action' },
+                session_id: { type: 'string', description: 'Session identifier (required for create/destroy/switch)' },
+            },
+            required: ['action'],
+        },
+    },
+];
+export const toolNames = new Set(tools.map(t => t.name));
+async function doCreate(args, ctx) {
+    const sm = ctx.sessionManager;
+    InputValidator.validateStringLength(args.session_id, 'session_id', 100, false);
+    try {
+        await sm.createSession(args.session_id);
+        return {
+            success: true,
+            session_id: args.session_id,
+            message: `Session '${args.session_id}' created successfully`,
+            total_sessions: sm.getSessionCount(),
+            max_sessions: sm.getMaxSessions(),
+        };
+    }
+    catch (error) {
+        // `err(...)` rather than `{ success: false }`: the dispatcher turns a
+        // failure-shaped object back into a PLAIN Error before categorising
+        // it, so a typed error thrown below this point loses its category on
+        // the way out and lands in `internal` — not retryable, and wrong
+        // about whose problem it is. Cross-model review caught that the
+        // typed errors were being destroyed at this seam (#382).
+        const message = error instanceof Error ? error.message : String(error);
+        return err(categorizeError(error), message);
+    }
+}
+async function doDestroy(args, ctx) {
+    const sm = ctx.sessionManager;
+    InputValidator.validateStringLength(args.session_id, 'session_id', 100, false);
+    try {
+        await sm.destroySession(args.session_id);
+        // Drop the session's history bundle (#179) and audio capture service
+        // (#180) so a future session with the same id starts fresh.
+        ctx.dropHistory(args.session_id);
+        ctx.dropAudioCaptureService(args.session_id);
+        return {
+            success: true,
+            session_id: args.session_id,
+            message: `Session '${args.session_id}' destroyed`,
+            remaining_sessions: sm.getSessionCount(),
+        };
+    }
+    catch (error) {
+        // `err(...)` rather than `{ success: false }`: the dispatcher turns a
+        // failure-shaped object back into a PLAIN Error before categorising
+        // it, so a typed error thrown below this point loses its category on
+        // the way out and lands in `internal` — not retryable, and wrong
+        // about whose problem it is. Cross-model review caught that the
+        // typed errors were being destroyed at this seam (#382).
+        const message = error instanceof Error ? error.message : String(error);
+        return err(categorizeError(error), message);
+    }
+}
+function doList(ctx) {
+    const sm = ctx.sessionManager;
+    const info = sm.getSessionsInfo();
+    const wrap = info.length === 0 ? empty : ok;
+    return wrap({
+        count: info.length,
+        max_sessions: sm.getMaxSessions(),
+        // Only when it exists. After a destroy, SessionManager resets this
+        // to the literal 'default', and reporting that named a session no
+        // caller could switch to or find in the list below (#421).
+        //
+        // Checked against `info` rather than by looking the session up:
+        // `getSession` stamps `lastActivity`, and listing sessions is not
+        // using one.
+        default_session: info.some(s => s.id === sm.getDefaultSessionId())
+            ? sm.getDefaultSessionId()
+            : null,
+        sessions: info.map(s => ({
+            id: s.id,
+            created: s.created.toISOString(),
+            last_activity: s.lastActivity.toISOString(),
+            is_playing: s.isPlaying,
+            is_default: s.id === sm.getDefaultSessionId(),
+        })),
+    });
+}
+function doSwitch(args, ctx) {
+    const sm = ctx.sessionManager;
+    InputValidator.validateStringLength(args.session_id, 'session_id', 100, false);
+    try {
+        sm.setDefaultSession(args.session_id);
+        return {
+            success: true,
+            default_session: args.session_id,
+            message: `Default session switched to '${args.session_id}'`,
+        };
+    }
+    catch (error) {
+        // `err(...)` rather than `{ success: false }`: the dispatcher turns a
+        // failure-shaped object back into a PLAIN Error before categorising
+        // it, so a typed error thrown below this point loses its category on
+        // the way out and lands in `internal` — not retryable, and wrong
+        // about whose problem it is. Cross-model review caught that the
+        // typed errors were being destroyed at this seam (#382).
+        const message = error instanceof Error ? error.message : String(error);
+        return err(categorizeError(error), message);
+    }
+}
+export async function execute(name, args, ctx) {
+    switch (name) {
+        case 'session': {
+            const a = args?.action;
+            switch (a) {
+                case 'create': return await doCreate(args, ctx);
+                case 'destroy': return await doDestroy(args, ctx);
+                case 'list': return doList(ctx);
+                case 'switch': return doSwitch(args, ctx);
+                default:
+                    throw new Error(`Invalid action: ${a}. Must be one of: create, destroy, list, switch`);
+            }
+        }
+        default:
+            throw new Error(`session module does not handle tool: ${name}`);
+    }
+}
+export const sessionModule = { tools, toolNames, execute };

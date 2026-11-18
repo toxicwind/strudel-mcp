@@ -1,0 +1,421 @@
+import { promises as fs } from 'fs';
+import { randomBytes } from 'crypto';
+import * as path from 'path';
+import { Logger } from './utils/Logger.js';
+import { ValidationError, BusinessError } from './utils/CategorisedError.js';
+/**
+ * Narrows a parsed JSON value to a pattern, or null when it is not one.
+ *
+ * `JSON.parse(data) as PatternData` is a cast: it asserts a shape rather
+ * than checking it, so a file that parses but lacks `tags` or
+ * `timestamp` threw further downstream and took the whole listing with
+ * it (#426).
+ */
+/**
+ * Longest pattern name that can actually be saved.
+ *
+ * 255 (the filesystem's limit on one path component) minus `.json` and
+ * minus the `.<16 hex>.tmp` suffix the atomic write needs beside it.
+ */
+const MAX_PATTERN_NAME_LENGTH = 255 - '.json'.length - ('.'.length + 16 + '.tmp'.length);
+function asPatternData(value) {
+    if (typeof value !== 'object' || value === null)
+        return null;
+    const candidate = value;
+    if (typeof candidate.name !== 'string')
+        return null;
+    if (typeof candidate.content !== 'string')
+        return null;
+    if (typeof candidate.timestamp !== 'string')
+        return null;
+    if (!Array.isArray(candidate.tags))
+        return null;
+    return candidate;
+}
+export class PatternStore {
+    basePath;
+    patternCache = new Map();
+    listCache = null;
+    LIST_CACHE_TTL = 5000; // 5 seconds
+    MAX_CACHE_SIZE = 100; // LRU cache limit
+    directoryEnsured = false;
+    logger;
+    constructor(basePath) {
+        this.basePath = basePath;
+        this.logger = new Logger();
+        this.ensureDirectory();
+    }
+    /**
+     * Sets a value in the cache with LRU eviction
+     * Maintains max cache size by evicting oldest entries
+     */
+    setCacheWithLRU(name, data) {
+        // If already exists, delete first to update insertion order (LRU)
+        if (this.patternCache.has(name)) {
+            this.patternCache.delete(name);
+        }
+        // Evict oldest entries if at capacity
+        while (this.patternCache.size >= this.MAX_CACHE_SIZE) {
+            const oldestKey = this.patternCache.keys().next().value;
+            if (oldestKey) {
+                this.patternCache.delete(oldestKey);
+            }
+        }
+        this.patternCache.set(name, data);
+    }
+    /**
+     * Gets a value from cache and updates its LRU position
+     */
+    getCacheWithLRU(name) {
+        const data = this.patternCache.get(name);
+        if (data) {
+            // Move to end (most recently used)
+            this.patternCache.delete(name);
+            this.patternCache.set(name, data);
+        }
+        return data;
+    }
+    async ensureDirectory() {
+        if (this.directoryEnsured)
+            return;
+        try {
+            await fs.mkdir(this.basePath, { recursive: true });
+            this.directoryEnsured = true;
+        }
+        catch (error) {
+            console.error('Failed to create patterns directory:', error);
+        }
+    }
+    /**
+     * Writes a pattern, refusing to silently destroy a different one.
+     *
+     * `sanitizeFilename` is many-to-one and always has been: `Track 1`,
+     * `TRACK 1` and `Track#1` all land on `track_1.json`, `drums/kick` and
+     * `synth/kick` both land on `kick.json`, and any two all-non-ASCII
+     * names collapse together. That mapping stays — names with spaces and
+     * capitals are natural for music, and rejecting them would break every
+     * pattern already saved.
+     *
+     * What changes is that a collision is no longer silent. Measured
+     * before this guard:
+     *
+     *     save("My-Jam", "VERSION-ONE"); save("my-jam", "VERSION-TWO")
+     *     -> one file, VERSION-ONE gone, both saves reported success
+     *
+     * Re-saving under the SAME original name is an ordinary update and is
+     * not a collision — refusing that would break every edit of an
+     * existing pattern.
+     *
+     * @param name - Pattern name as the caller spells it
+     * @param content - Pattern source
+     * @param tags - Tags to attach
+     * @param options.overwrite - Replace a different pattern on the same
+     *   filename. Deliberately explicit: the loss is not recoverable.
+     * @throws {ValidationError} When the filename is taken by a pattern
+     *   saved under a different name and `overwrite` is not set
+     */
+    async save(name, content, tags = [], options = {}) {
+        await this.ensureDirectory();
+        const filename = this.sanitizeFilename(name) + '.json';
+        const filepath = path.join(this.basePath, filename);
+        // One file, one cache entry. See the note on setCacheWithLRU below.
+        const cacheKey = this.sanitizeFilename(name);
+        if (options.overwrite !== true) {
+            const existing = await this.readIfPresent(filepath);
+            if (existing !== null && existing.name !== name) {
+                throw new ValidationError(`Cannot save "${name}": the name "${existing.name}" already uses the file ` +
+                    `${filename}. Names are lowercased and stripped of punctuation, so these ` +
+                    `collide. Choose a name that differs by more than case or punctuation, or ` +
+                    `pass overwrite: true to replace "${existing.name}" — which cannot be undone.`);
+            }
+        }
+        const data = {
+            name,
+            content,
+            // Copied, not aliased. The caller's array was stored by reference
+            // and cached, so mutating it after the save changed what `load`
+            // returned while the file on disk kept the original — the cache
+            // and the disk disagreeing, which is the thing #428 exists to
+            // prevent:
+            //
+            //   const tags = ['x'];
+            //   await save('p', 'code', tags);
+            //   tags[0] = 'y';
+            //   (await load('p')).tags   // ['y'], file holds ['x']  (#473)
+            tags: [...tags],
+            timestamp: new Date().toISOString(),
+        };
+        // Write first, cache second.
+        //
+        // The cache used to be written before the file, so a rejected write
+        // left a pattern cached that was never persisted and `load` served
+        // it as though it had been. A 255-character name reaches here — it
+        // passes InputValidator's 255 limit and `sanitizeFilename` measures
+        // the stem without `.json` — and then fails ENAMETOOLONG on the
+        // 260-byte component (#428).
+        // Write to a temp file, then rename.
+        //
+        // `rename` is atomic within a filesystem, so a reader sees either
+        // the old pattern or the new one and never a half-written file. The
+        // direct write left truncated JSON behind on a crash or a full disk
+        // — which is exactly the input that used to take the entire listing
+        // down (#426). That fix made the listing survive such a file; this
+        // one stops producing them.
+        //
+        // The temp name is random, and the write is exclusive.
+        //
+        // A predictable name (pid plus a counter) is guessable, so anyone
+        // able to write into the pattern directory could pre-create it as a
+        // symlink and redirect the write elsewhere — CodeQL flags exactly
+        // this as js/insecure-temporary-file, and it was right. `randomBytes`
+        // removes the guess and the `wx` flag refuses to open a path that
+        // already exists, symlink included, rather than following it.
+        //
+        // It sits in the same directory so the rename stays within one
+        // filesystem, which is what makes the rename atomic.
+        const tempPath = `${filepath}.${randomBytes(8).toString('hex')}.tmp`;
+        try {
+            // `mode: 0o600` is the part CodeQL's js/insecure-temporary-file is
+            // actually about — "accessible by other users". A temp file
+            // holding the user's pattern has no business being world-readable
+            // even for the instant before the rename.
+            await fs.writeFile(tempPath, JSON.stringify(data, null, 2), { flag: 'wx', mode: 0o600 });
+            await fs.rename(tempPath, filepath);
+        }
+        catch (error) {
+            // Leaving a stray .tmp would make it the next listing's problem.
+            await fs.unlink(tempPath).catch(() => undefined);
+            throw error;
+        }
+        // Keyed by the FILE's name, not the caller's.
+        //
+        // The cache was keyed by the raw name while the file is keyed by the
+        // sanitized one, so two names that sanitize alike had one file and
+        // two cache entries. Measured:
+        //
+        //   save("My-Jam", "VERSION-ONE"); save("my-jam", "VERSION-TWO")
+        //   files on disk: ["my-jam.json"]  disk content: VERSION-TWO
+        //   load("My-Jam") -> VERSION-ONE   load("my-jam") -> VERSION-TWO
+        //
+        // Two answers for one file, and the stale one never expires — this
+        // cache has no TTL.
+        this.setCacheWithLRU(cacheKey, data);
+        this.listCache = null; // Invalidate list cache
+    }
+    /**
+     * The pattern in a file, or null when it is absent or unreadable.
+     *
+     * An unreadable file is treated as absent on purpose: refusing a save
+     * because something in the directory cannot be parsed would make one
+     * corrupt file block writes, which is the mistake #426 fixed for
+     * reads.
+     */
+    async readIfPresent(filepath) {
+        try {
+            return asPatternData(JSON.parse(await fs.readFile(filepath, 'utf-8')));
+        }
+        catch {
+            return null;
+        }
+    }
+    async load(name) {
+        // Keyed by the file, not the caller's spelling of it (#428).
+        const cacheKey = this.sanitizeFilename(name);
+        // Check cache first with LRU update
+        const cached = this.getCacheWithLRU(cacheKey);
+        if (cached) {
+            return cached;
+        }
+        const filename = cacheKey + '.json';
+        const filepath = path.join(this.basePath, filename);
+        try {
+            const data = await fs.readFile(filepath, 'utf-8');
+            // Validated, like every other reader.
+            //
+            // `load` parsed the JSON and returned it, so a file holding
+            // `{"nonsense": 1}` or `[1,2,3]` came back as a PatternData that
+            // is nothing of the kind — and callers read `.code` off it and
+            // wrote `undefined` into the editor. `listDetailed` and
+            // `readIfPresent` both run `asPatternData`; this one never got
+            // the #426 hardening, so the two disagreed about the same file:
+            // the listing skipped it as malformed while `load` handed it
+            // straight back (#471).
+            const pattern = asPatternData(JSON.parse(data));
+            if (pattern === null) {
+                this.logger.warn(`Pattern file is not a pattern: ${filename}`);
+                return null;
+            }
+            // Update cache with LRU eviction
+            this.setCacheWithLRU(cacheKey, pattern);
+            return pattern;
+        }
+        catch (error) {
+            this.logger.warn(`Failed to load pattern: ${name}`, error);
+            return null;
+        }
+    }
+    /**
+     * Patterns, plus how many files could not be read.
+     *
+     * A partial listing presented as complete is the same lie as reporting
+     * zero, quieter — the store logs what it skipped and no MCP client
+     * reads the log (#426; #335 is the precedent for making a warning
+     * reach the caller).
+     */
+    async listDetailed(tag) {
+        return this.readAll(tag);
+    }
+    async list(tag) {
+        return (await this.readAll(tag)).patterns;
+    }
+    /**
+     * The one read. Returns the count WITH the data.
+     *
+     * This used to leave the count on the instance as `skippedInLastRead`
+     * and have `listDetailed` pick it up after awaiting `list`. The
+     * docstring above it disclaimed exactly that design — "a
+     * `getLastSkipped()` would belong to whichever listing finished most
+     * recently, and two concurrent calls would cross their answers" —
+     * while the code did it anyway: the field is written inside `list`
+     * and read after an await, so two concurrent listings genuinely
+     * could, and the second one's count would be reported for the first
+     * one's patterns (#473).
+     *
+     * Returning both from one call is what makes the docstring true.
+     */
+    async readAll(tag) {
+        // Use cached list if available and not expired
+        const now = Date.now();
+        if (!tag && this.listCache && (now - this.listCache.timestamp) < this.LIST_CACHE_TTL) {
+            // The cached listing carries its own skipped count, so a cache hit
+            // does not inherit the previous uncached read's.
+            return { patterns: this.listCache.patterns, skipped: this.listCache.skipped };
+        }
+        try {
+            await this.ensureDirectory();
+            const files = await fs.readdir(this.basePath);
+            // Parallel file reading for better performance.
+            //
+            // `allSettled`, not `all`. Fail-fast meant one truncated or
+            // unparseable `.json` rejected the whole batch, the catch below
+            // returned `[]`, and `doList` reported that as the success "No
+            // patterns found" — measured, five saved patterns plus one
+            // truncated file listed as zero (#426). A hundred patterns and one
+            // bad file told the user they had none.
+            const results = await Promise.allSettled(files
+                .filter(file => file.endsWith('.json'))
+                .map(async (file) => {
+                const filepath = path.join(this.basePath, file);
+                const data = await fs.readFile(filepath, 'utf-8');
+                return { file, parsed: JSON.parse(data) };
+            }));
+            const allPatterns = [];
+            const skipped = [];
+            for (const result of results) {
+                if (result.status !== 'fulfilled') {
+                    skipped.push('unreadable');
+                    continue;
+                }
+                // A cast is not a check. A file missing `timestamp` threw in the
+                // sort below and one missing `tags` threw in the tag filter —
+                // each taking the entire listing down the same way a truncated
+                // file did.
+                const pattern = asPatternData(result.value.parsed);
+                if (pattern === null) {
+                    skipped.push(result.value.file);
+                    continue;
+                }
+                allPatterns.push(pattern);
+            }
+            if (skipped.length > 0) {
+                this.logger.warn(`Skipped ${String(skipped.length)} unreadable or malformed pattern file(s)`, { skipped });
+            }
+            // Filter and sort
+            const filteredPatterns = tag
+                ? allPatterns.filter(p => p.tags.includes(tag))
+                : allPatterns;
+            const sorted = filteredPatterns.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+            // Update cache only for non-filtered lists
+            if (!tag) {
+                this.listCache = { patterns: sorted, timestamp: now, skipped: skipped.length };
+            }
+            return { patterns: sorted, skipped: skipped.length };
+        }
+        catch (error) {
+            // A directory that cannot be READ is not a directory with no
+            // patterns in it.
+            //
+            // Individual bad files are already handled above by `allSettled`
+            // and counted in `skipped`, so this catch only fires when the
+            // whole directory is unavailable — the readdir or the
+            // ensureDirectory failed. Returning `[]` reported that as a clean
+            // empty listing:
+            //
+            //   chmod 000 <store>;  listDetailed()
+            //     -> {"patterns":[],"skipped":0}
+            //
+            // which tells the caller they have no saved patterns when the
+            // truth is that nothing could be looked at. That is #426's lie
+            // exactly, reached down a different path (#473).
+            this.logger.warn(`Failed to list patterns${tag ? ` with tag: ${tag}` : ''}`, error);
+            const reason = error instanceof Error ? error.message : String(error);
+            throw new BusinessError(`Cannot read the pattern directory ${this.basePath}: ${reason}`);
+        }
+    }
+    // Clear cache method
+    clearCache() {
+        this.patternCache.clear();
+        this.listCache = null;
+    }
+    /**
+     * Returns cache statistics for monitoring
+     */
+    getCacheStats() {
+        return {
+            size: this.patternCache.size,
+            maxSize: this.MAX_CACHE_SIZE,
+            listCacheValid: this.listCache !== null &&
+                (Date.now() - this.listCache.timestamp) < this.LIST_CACHE_TTL
+        };
+    }
+    /**
+     * Sanitizes a pattern name to create a safe filename
+     * Prevents path traversal attacks and ensures cross-platform compatibility
+     * @param name - The pattern name to sanitize
+     * @returns A safe filename without extension
+     * @throws Error if the name is invalid or uses reserved names
+     */
+    sanitizeFilename(name) {
+        // Use path.basename to prevent path traversal attacks
+        const baseName = path.basename(name);
+        // Remove dangerous characters and normalize
+        const cleaned = baseName
+            .replace(/[^a-z0-9_-]/gi, '_')
+            .toLowerCase();
+        // Validate length against the ceiling that actually exists.
+        //
+        // The stem is not the whole filename. `.json` costs 5 bytes, and
+        // the atomic write needs `<file>.<16 hex>.tmp` to fit in the same
+        // directory entry, which costs 21 more. A 255-byte component is the
+        // limit on ext4 and on every filesystem this runs on, so the real
+        // ceiling for the stem is 229.
+        //
+        // This check said 255 and let anything under it through to fail as
+        // a raw ENAMETOOLONG from `fs` — an uncategorised Error, so the
+        // envelope called it `internal` and not retryable, when it is
+        // exactly the caller's input being too long (#471, and the same
+        // class of miscategorisation as #382). Saving a 230-character name
+        // has never worked; it now says so, in a message with the number
+        // in it.
+        if (cleaned.length === 0 || cleaned.length > MAX_PATTERN_NAME_LENGTH) {
+            throw new ValidationError(`Pattern name must be between 1 and ${MAX_PATTERN_NAME_LENGTH} characters `
+                + `after sanitizing; got ${cleaned.length}.`);
+        }
+        // Prevent reserved filenames on Windows
+        const reserved = ['con', 'prn', 'aux', 'nul', 'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9'];
+        if (reserved.includes(cleaned.toLowerCase())) {
+            throw new ValidationError('Pattern name uses a reserved filename');
+        }
+        return cleaned;
+    }
+}

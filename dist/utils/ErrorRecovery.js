@@ -1,0 +1,268 @@
+/**
+ * ErrorRecovery - Provides graceful error handling and recovery mechanisms
+ * Ensures the MCP server can recover from browser crashes, network issues, and pattern errors
+ */
+import { Logger } from './Logger.js';
+export class ErrorRecovery {
+    logger;
+    errorHistory = new Map();
+    /**
+     * Failures that a retry or fallback went on to rescue.
+     *
+     * Kept apart from `errorHistory` because success calls
+     * clearErrorHistory, which used to erase exactly the case an operator
+     * most wants to see — "writes are flaky but recovering on retry 2".
+     * Measured before this: a run that failed once then succeeded
+     * reported `{}`, indistinguishable from a run with no trouble at all
+     * (#286).
+     */
+    recoveredHistory = new Map();
+    /**
+     * Operations that actually feed these statistics. Only
+     * handlePatternWrite routes through executeWithRetry today, so an
+     * empty map meant "nothing instrumented reported trouble", not "the
+     * system is healthy" — and the Record<string, …> shape implied
+     * coverage that did not exist. Reported explicitly so a reader can
+     * tell the two apart (#286).
+     */
+    /**
+     * Operations `getErrorStats` seeds with an explicit zero row.
+     *
+     * This named 'Pattern Write' — which nothing calls: its only path,
+     * `handlePatternWrite`, is reached solely from
+     * `writePatternWithValidation`, and nothing in `src/server` calls
+     * that. So diagnostics carried a permanent all-zero row for dead code
+     * while omitting the one operation that does run (#445).
+     *
+     * 'Browser Init' is the live one, from `StrudelController.ts:199`
+     * (#315). A zero row for it is the useful kind: it says the retry
+     * path exists and has not fired, which is exactly what an operator
+     * wants to know before a failure rather than after.
+     */
+    static INSTRUMENTED_OPERATIONS = ['Browser Init'];
+    ERROR_WINDOW = 60000; // 1 minute window for error tracking
+    /**
+     * Operations this instance has handled, successfully or not.
+     *
+     * The seed list above says which paths EXIST; this says which have
+     * RUN. A clean run has no error and no recovery to record, so without
+     * it a successful operation left no row and looked identical to one
+     * nothing ever watched — the ambiguity #288 removed for the seeded
+     * names and left everywhere else.
+     */
+    seenOperations = new Set();
+    constructor() {
+        this.logger = new Logger();
+    }
+    /**
+     * Executes an operation with automatic retry logic
+     * @param operation - Async function to execute
+     * @param operationName - Name for logging
+     * @param strategy - Recovery strategy configuration
+     * @returns Result of the operation
+     */
+    /**
+     * Note on reachability: the only production entry point into this
+     * class is `handlePatternWrite`, which calls this. `executeWithRetry`
+     * and `clearErrorHistory` are public because they are the seam the
+     * retry tests drive directly, not because anything else calls them.
+     *
+     * Seven methods that nothing called at all — handleBrowserInit,
+     * handleNetworkOperation, createCircuitBreaker, isFrequentlyFailing,
+     * executeWithTimeout, executeWithRetryAndTimeout and
+     * clearAllErrorHistory — were removed in #309. They were fully tested,
+     * which is how the file reported 100% coverage while most of it was
+     * unreachable, and how the docs could describe an `ErrorRecovery.withRetry`
+     * that never existed without anything noticing.
+     *
+     * Browser init and strudel.cc requests still have no retry. That gap
+     * is real and is tracked separately: reviving deleted machinery
+     * deserves the scrutiny of new code, not a restore from history.
+     */
+    async executeWithRetry(operation, operationName, strategy = {
+        maxRetries: 3,
+        retryDelay: 1000,
+        exponentialBackoff: true
+    }) {
+        // Recorded on entry: an operation that ran and succeeded should
+        // report an explicit zero rather than no row at all (#288's
+        // distinction, which only the seeded names used to get).
+        this.seenOperations.add(operationName);
+        let lastError = null;
+        for (let attempt = 0; attempt <= strategy.maxRetries; attempt++) {
+            try {
+                this.logger.debug(`Executing ${operationName} (attempt ${attempt + 1}/${strategy.maxRetries + 1})`);
+                const result = await operation();
+                // Success. The failures that preceded it still happened, so
+                // move them to the recovered log rather than dropping them —
+                // dropping them is what made recovered flakiness invisible
+                // (#286). recordRecovery clears the outstanding bucket itself.
+                this.recordRecovery(operationName);
+                // The error bucket only — not `clearErrorHistory`, which also
+                // forgets that the operation ran and would make every success
+                // erase its own zero row (#445).
+                this.errorHistory.delete(operationName);
+                return result;
+            }
+            catch (error) {
+                lastError = error;
+                this.recordError(operationName);
+                this.logger.warn(`${operationName} failed (attempt ${attempt + 1}/${strategy.maxRetries + 1})`, { error: error.message });
+                // Don't retry on last attempt
+                if (attempt < strategy.maxRetries) {
+                    const base = strategy.exponentialBackoff
+                        ? strategy.retryDelay * Math.pow(2, attempt)
+                        : strategy.retryDelay;
+                    // Full-jitter-lite: half the computed delay plus a random half.
+                    const delay = strategy.jitter
+                        ? Math.round(base * (0.5 + Math.random() * 0.5))
+                        : base;
+                    this.logger.debug(`Waiting ${delay}ms before retry`);
+                    await this.sleep(delay);
+                }
+            }
+        }
+        // All retries failed
+        this.logger.error(`${operationName} failed after ${strategy.maxRetries + 1} attempts`);
+        // Try fallback if available
+        if (strategy.fallbackAction) {
+            this.logger.info(`Executing fallback for ${operationName}`);
+            try {
+                const fallbackResult = await strategy.fallbackAction();
+                // The fallback rescued it, so these failures are recovered too.
+                this.recordRecovery(operationName);
+                return fallbackResult;
+            }
+            catch (fallbackError) {
+                this.logger.error(`Fallback failed for ${operationName}`, fallbackError);
+            }
+        }
+        throw new Error(`${operationName} failed after ${strategy.maxRetries + 1} attempts: ${lastError?.message}`);
+    }
+    /**
+     * Handles pattern write errors with validation
+     * @param writeFunction - Pattern write function
+     * @param pattern - Pattern to write
+     * @returns Write result
+     */
+    async handlePatternWrite(writeFunction, pattern) {
+        return this.executeWithRetry(() => writeFunction(pattern), 'Pattern Write', {
+            maxRetries: 2,
+            retryDelay: 500,
+            exponentialBackoff: false,
+            fallbackAction: async () => {
+                // Try writing a simplified version
+                const simplified = this.simplifyPattern(pattern);
+                this.logger.info('Attempting to write simplified pattern');
+                return writeFunction(simplified);
+            }
+        });
+    }
+    /**
+     * Gets error statistics for monitoring
+     * @returns Error statistics by operation
+     */
+    getErrorStats() {
+        const stats = {};
+        const now = Date.now();
+        const recent = (ts) => ts.filter(t => now - t < this.ERROR_WINDOW);
+        // Seed with every instrumented operation so an all-zero row is
+        // distinguishable from an operation nothing ever watched. `{}` used
+        // to mean both.
+        const operations = new Set([
+            ...ErrorRecovery.INSTRUMENTED_OPERATIONS,
+            ...this.seenOperations,
+            ...this.errorHistory.keys(),
+            ...this.recoveredHistory.keys(),
+        ]);
+        for (const operation of operations) {
+            const failed = recent(this.errorHistory.get(operation) ?? []);
+            const rescued = recent(this.recoveredHistory.get(operation) ?? []);
+            stats[operation] = {
+                count: failed.length,
+                lastError: failed.length > 0 ? new Date(Math.max(...failed)) : null,
+                recovered: rescued.length,
+                lastRecovery: rescued.length > 0 ? new Date(Math.max(...rescued)) : null,
+            };
+        }
+        return stats;
+    }
+    /**
+     * Clears error history for a specific operation
+     * @param operationName - Operation to clear
+     */
+    clearErrorHistory(operationName) {
+        // Forgotten entirely, including that it ever ran — "clear this
+        // operation's history" that left a zero row behind would be a
+        // different promise than this method's name makes.
+        //
+        // The success path inside `executeWithRetry` does NOT use this: it
+        // clears the error bucket directly, because an operation that just
+        // succeeded has run and should report an explicit zero rather than
+        // vanish (#288, #445).
+        this.seenOperations.delete(operationName);
+        this.errorHistory.delete(operationName);
+    }
+    /**
+     * Moves an operation's recorded failures into the recovered log.
+     *
+     * Called when a retry or fallback rescues the operation, so the
+     * failures survive the clearErrorHistory that follows.
+     *
+     * @param operationName - Name of the operation
+     */
+    recordRecovery(operationName) {
+        const failures = this.errorHistory.get(operationName);
+        if (!failures || failures.length === 0)
+            return;
+        const now = Date.now();
+        const existing = this.recoveredHistory.get(operationName) ?? [];
+        const merged = [...existing, ...failures]
+            .filter(ts => now - ts < this.ERROR_WINDOW);
+        this.recoveredHistory.set(operationName, merged);
+        // A move, not a copy: a failure belongs in exactly one bucket, or
+        // the fallback path reports the same three failures as both
+        // outstanding and rescued.
+        this.errorHistory.delete(operationName);
+    }
+    /**
+     * Records an error occurrence
+     * @param operationName - Name of the operation
+     */
+    recordError(operationName) {
+        const errors = this.errorHistory.get(operationName) || [];
+        errors.push(Date.now());
+        // Keep only recent errors
+        const now = Date.now();
+        const recentErrors = errors.filter(ts => now - ts < this.ERROR_WINDOW);
+        this.errorHistory.set(operationName, recentErrors);
+    }
+    /**
+     * Sleep utility
+     * @param ms - Milliseconds to sleep
+     * @returns Promise that resolves after delay
+     */
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    /**
+     * Simplifies a pattern by removing complex modifiers
+     * @param pattern - Original pattern
+     * @returns Simplified pattern
+     */
+    simplifyPattern(pattern) {
+        // Remove complex modifiers but keep core structure
+        let simplified = pattern;
+        // Remove effect chains but keep basic sound/note calls
+        simplified = simplified.replace(/\.(delay|reverb|room|lpf|hpf|bpf)\([^)]*\)/g, '');
+        // Remove complex transformations
+        simplified = simplified.replace(/\.(jux|iter|chop|striate|scramble)\([^)]*\)/g, '');
+        // Remove conditional modifications
+        simplified = simplified.replace(/\.(sometimes|often|rarely|every)\([^)]*\)/g, '');
+        this.logger.debug('Pattern simplified', {
+            original: pattern.substring(0, 50) + '...',
+            simplified: simplified.substring(0, 50) + '...'
+        });
+        return simplified;
+    }
+}

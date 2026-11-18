@@ -1,0 +1,1008 @@
+import { chromium } from 'playwright';
+import * as path from 'path';
+import { promises as fs } from 'fs';
+import { AudioAnalyzer } from './AudioAnalyzer.js';
+import { PatternValidator } from './utils/PatternValidator.js';
+import { DEFAULT_BLOCK_RESOURCES, DEFAULT_STRUDEL_URL, DEFAULT_VIEWPORT, } from './utils/ServerConfig.js';
+import { resolveSafeOutputPath } from './utils/SafePath.js';
+import { ErrorRecovery } from './utils/ErrorRecovery.js';
+import { Logger } from './utils/Logger.js';
+export async function waitForStrudelReady(page, timeoutMs = 5000) {
+    await page.waitForSelector('.cm-content', { timeout: 8000 });
+    try {
+        await page.waitForFunction(
+        /* istanbul ignore next */ () => Boolean(window.strudelMirror?.editor?.dispatch), { timeout: timeoutMs });
+    }
+    catch {
+        throw new Error(`Strudel editor did not become ready within ${timeoutMs}ms. ` +
+            'The page may have failed to load or strudel.cc may have changed its API.');
+    }
+}
+export const DEFAULT_PLAYBACK_BUDGET = {
+    firstPlayMs: 15_000,
+    subsequentPlayMs: 3_000,
+};
+export class StrudelController {
+    browser = null;
+    _page = null;
+    analyzer;
+    validator;
+    errorRecovery;
+    logger;
+    isHeadless;
+    /** Strudel REPL URL; `strudel_url` in config.json (#227). */
+    strudelUrl;
+    /** Playwright viewport; null lets the page track the OS window (#514). */
+    viewport;
+    /** Resource types the init route aborts (#514). */
+    blockResources;
+    editorCache = '';
+    cacheTimestamp = 0;
+    CACHE_TTL = 100; // milliseconds
+    MAX_CONSOLE_MESSAGES = 1000; // Ring buffer limit
+    isPlaying = false;
+    // True once the user gesture for AudioContext has been established
+    // (first play-button click per session). Subsequent plays can use the
+    // keyboard shortcut cleanly because AudioContext is already resumed.
+    hasEstablishedGesture = false;
+    playbackBudget;
+    consoleErrors = [];
+    consoleWarnings = [];
+    constructor(headless = false, audioAnalysisConfig, strudelUrl = DEFAULT_STRUDEL_URL, 
+    // Injectable so a test asserting a start FAILURE does not have to
+    // wait out a budget sized for a real cold start.
+    playbackBudget = DEFAULT_PLAYBACK_BUDGET, 
+    // Page-setup overrides from config.json `viewport` / `block_resources` (#514).
+    fidelity = {}) {
+        this.playbackBudget = playbackBudget;
+        this.isHeadless = headless;
+        this.strudelUrl = strudelUrl;
+        this.viewport = fidelity.viewport !== undefined ? fidelity.viewport : DEFAULT_VIEWPORT;
+        this.blockResources = fidelity.blockResources ?? DEFAULT_BLOCK_RESOURCES;
+        this.analyzer = new AudioAnalyzer(audioAnalysisConfig);
+        this.validator = new PatternValidator();
+        this.errorRecovery = new ErrorRecovery();
+        this.logger = new Logger();
+    }
+    /**
+     * Returns true iff both the browser and its page are still alive.
+     * Used by `initialize()` to detect a stale session where the user
+     * (or a crash) closed the page out from under us, and by callers
+     * that want to verify before issuing a tool call (#202).
+     */
+    /** The page whose console this controller is already listening to. */
+    consoleMonitoredPage = null;
+    isAlive() {
+        return this.browser !== null && this._page !== null && !this._page.isClosed();
+    }
+    /**
+     * Initializes the browser and navigates to Strudel.cc.
+     *
+     * Idempotent and self-healing (#202): if a previous init succeeded but
+     * the page has since been closed (manual user close, crash, navigation
+     * error), the next call tears down the dead browser and re-initializes
+     * rather than returning "Already initialized" and leaving callers to
+     * fail with `Target page, context or browser has been closed`.
+     *
+     * @returns Success message when initialization is complete
+     * @throws {Error} When browser launch or page navigation fails
+     */
+    async initialize() {
+        if (this.isAlive()) {
+            return 'Already initialized';
+        }
+        // Browser handle exists but page is dead — clean up before re-init so
+        // we don't leak a dangling Chromium process.
+        if (this.browser !== null) {
+            this.logger.warn('Stale browser detected (page closed); recreating');
+            try {
+                await this.cleanup();
+            }
+            catch (e) {
+                // cleanup failures shouldn't block re-init; the next launch is
+                // what matters. The stale process becomes the OS's problem.
+                this.logger.warn(`Cleanup during recovery failed: ${e?.message ?? e}`);
+            }
+        }
+        this.browser = await chromium.launch({
+            headless: this.isHeadless,
+            args: [
+                '--use-fake-ui-for-media-stream',
+                '--autoplay-policy=no-user-gesture-required',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-gpu',
+                '--disable-software-rasterizer'
+            ],
+        });
+        const context = await this.browser.newContext({
+            permissions: ['microphone'],
+            // null is meaningful: Playwright tracks the real window size, so
+            // resizes reach the page and canvases re-measure (#514).
+            viewport: this.viewport,
+            reducedMotion: 'reduce',
+        });
+        this._page = await context.newPage();
+        // Optimize page loading
+        await this._page.route('**/*', (route) => {
+            const resourceType = route.request().resourceType();
+            // Abort the configured resource classes; an empty
+            // block_resources blocks nothing (#514).
+            if (this.blockResources.includes(resourceType)) {
+                route.abort();
+            }
+            else {
+                route.continue();
+            }
+        });
+        // Navigation and readiness are the only parts of init that depend on
+        // a live third-party site, and they had no retry at all: one hiccup
+        // from strudel.cc surfaced to the calling agent as a hard error
+        // (#315). chromium.launch is deliberately outside the retry — a
+        // local process launch does not fail transiently, and relaunching it
+        // would cost seconds per attempt.
+        const page = this._page;
+        // Everything past `newPage()` is rolled back if it fails.
+        //
+        // Without this, a failed navigation left `browser` and `_page`
+        // assigned with the page sitting on about:blank. `isAlive()` only
+        // asks whether the page is CLOSED, so it said yes; the server clears
+        // `isInitialized` only when `isAlive()` is false, so the next call
+        // re-entered `initialize()`, hit the `'Already initialized'`
+        // shortcut, and every tool after that failed on a blank page with
+        // "editor not found after 3 attempts" — permanently, with no path
+        // back short of a restart.
+        //
+        // #202 and #206 cover a page that DIED. This is a page that was
+        // never born, which their `isAlive()` check cannot distinguish from
+        // a healthy one (#456).
+        try {
+            await this.errorRecovery.executeWithRetry(async () => {
+                await page.goto(this.strudelUrl, {
+                    waitUntil: 'domcontentloaded', // Changed from networkidle for faster load
+                    timeout: 15000,
+                });
+                await waitForStrudelReady(page);
+            }, 'Browser Init', {
+                maxRetries: 2,
+                retryDelay: 750,
+                exponentialBackoff: true,
+                // Sessions that hit the same upstream hiccup must not retry in
+                // lockstep and concentrate load on a struggling service.
+                jitter: true,
+            });
+            // Set up console monitoring for runtime errors
+            this.setupConsoleMonitoring();
+            await this.analyzer.inject(this._page);
+        }
+        catch (error) {
+            // Leave nothing half-built behind, so the next init starts clean.
+            await this.cleanup().catch(() => undefined);
+            throw error;
+        }
+        return 'Strudel initialized successfully';
+    }
+    /**
+     * Pushes a message to an array with ring buffer behavior (FIFO eviction)
+     */
+    pushWithLimit(arr, message) {
+        if (arr.length >= this.MAX_CONSOLE_MESSAGES) {
+            arr.shift(); // Remove oldest entry
+        }
+        arr.push(message);
+    }
+    /**
+     * Sets up console error/warning monitoring
+     * Captures Strudel runtime errors that static validation can't catch
+     */
+    setupConsoleMonitoring() {
+        if (!this._page)
+            return;
+        // One listener per page.
+        //
+        // `page.on` appends, and nothing removed the previous listener, so
+        // a second call recorded every console message twice and doubled
+        // the error count `diagnostics` reports. `initialize()` calls this,
+        // and so does SessionManager on its own path; they do not currently
+        // overlap, but nothing stopped them (#488).
+        if (this.consoleMonitoredPage === this._page)
+            return;
+        this.consoleMonitoredPage = this._page;
+        this._page.on('console', (msg) => {
+            const type = msg.type();
+            const text = msg.text();
+            if (type === 'error') {
+                this.pushWithLimit(this.consoleErrors, text);
+                this.logger.error('Strudel console error:', text);
+            }
+            else if (type === 'warning') {
+                this.pushWithLimit(this.consoleWarnings, text);
+                this.logger.warn('Strudel console warning:', text);
+            }
+        });
+        this._page.on('pageerror', (error) => {
+            this.pushWithLimit(this.consoleErrors, error.message);
+            this.logger.error('Strudel page error:', error.message);
+        });
+    }
+    /**
+     * Writes a Strudel pattern to the editor
+     * @param pattern - The pattern code to write
+     * @returns Success message with pattern length
+     * @throws {Error} When not initialized
+     */
+    async writePattern(pattern) {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        // Invalidate cache before write to prevent stale reads
+        this.invalidateCache();
+        // And forget the onsets collected from the PREVIOUS pattern. Without
+        // this the first tempo reading after a change describes the pattern
+        // before it: playing dnb at 174 and then house at 125, the first
+        // house reading came back 174 (#366).
+        await this.analyzer.resetTempoHistory(this._page);
+        // Retry logic for timing edge cases
+        const maxRetries = 3;
+        const retryDelay = 100; // ms
+        let success = false;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            // Use strudelMirror API (correct approach for strudel.cc)
+            success = await this._page.evaluate(/* istanbul ignore next */ (newPattern) => {
+                const sm = window.strudelMirror;
+                if (sm?.editor?.dispatch) {
+                    const view = sm.editor;
+                    view.dispatch({
+                        changes: { from: 0, to: view.state.doc.length, insert: newPattern }
+                    });
+                    return true;
+                }
+                return false;
+            }, pattern);
+            if (success) {
+                break;
+            }
+            if (attempt < maxRetries - 1) {
+                this.logger.warn(`Write attempt ${attempt + 1} failed, retrying...`);
+                await this._page.waitForTimeout(retryDelay);
+            }
+        }
+        if (!success) {
+            throw new Error('Failed to write pattern - editor not found or view unavailable after 3 attempts');
+        }
+        // Verify the write by reading back from browser (fixes cache sync issues)
+        const verified = await this._page.evaluate(/* istanbul ignore next */ () => {
+            const sm = window.strudelMirror;
+            // Use code property or editor state
+            if (sm?.code)
+                return sm.code;
+            if (sm?.editor?.state?.doc)
+                return sm.editor.state.doc.toString();
+            return null;
+        });
+        // Update cache with verified content
+        this.editorCache = verified || pattern;
+        this.cacheTimestamp = Date.now();
+        // Log warning if verification failed
+        if (verified === null) {
+            this.logger.warn('Pattern write verification failed - using input pattern for cache');
+        }
+        return `Pattern written (${pattern.length} chars)`;
+    }
+    /**
+     * Retrieves the current pattern from the editor
+     * @returns The current pattern text content
+     * @throws {Error} When not initialized
+     */
+    async getCurrentPattern() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        // Return cached value if still valid
+        const now = Date.now();
+        if (this.editorCache && (now - this.cacheTimestamp) < this.CACHE_TTL) {
+            return this.editorCache;
+        }
+        const pattern = await this._page.evaluate(/* istanbul ignore next */ () => {
+            const sm = window.strudelMirror;
+            // Use code property or editor state
+            if (sm?.code)
+                return sm.code;
+            if (sm?.editor?.state?.doc)
+                return sm.editor.state.doc.toString();
+            return '';
+        });
+        // Update cache
+        this.editorCache = pattern;
+        this.cacheTimestamp = now;
+        return pattern;
+    }
+    /**
+     * Reads Strudel's own scheduler state.
+     *
+     * `this.isPlaying` used to be set optimistically, which is how #218
+     * happened: stop() reported "Stopped" and diagnostics reported
+     * playing:false while audio kept running. Ask the page instead.
+     *
+     * @returns True if Strudel's REPL scheduler is started
+     */
+    async readPlaybackState() {
+        if (!this._page)
+            return 'unreadable';
+        try {
+            const started = await this._page.evaluate(/* istanbul ignore next */ () => {
+                const sm = window.strudelMirror;
+                return Boolean(sm?.repl?.state?.started ?? sm?.repl?.scheduler?.started);
+            });
+            return started ? 'playing' : 'stopped';
+        }
+        catch {
+            // Three values, not two. Returning `false` here meant "could not
+            // read" and "not playing" were the same answer — so
+            // waitForPlaybackState(false) succeeded instantly on a dead page and
+            // stop() reported "Stopped" for audio it never touched. That is the
+            // symptom #218 was filed for, reintroduced through the error path
+            // rather than through optimistic state (#278).
+            return 'unreadable';
+        }
+    }
+    /**
+     * Polls until Strudel's scheduler reaches the desired state.
+     * @param desired - State to wait for
+     * @param timeoutMs - Maximum time to wait
+     * @returns True if the state was reached before the timeout
+     */
+    async waitForPlaybackState(desired, timeoutMs) {
+        const target = desired ? 'playing' : 'stopped';
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            // 'unreadable' never satisfies the wait. It used to satisfy the
+            // stop case by coincidence, because it shared a value with
+            // 'stopped'.
+            if (await this.readPlaybackState() === target)
+                return true;
+            if (Date.now() >= deadline)
+                return false;
+            await this._page?.waitForTimeout(50);
+        }
+    }
+    /**
+     * Starts playing the current pattern
+     * @returns Success message
+     * @throws {Error} When not initialized, or when playback fails to start
+     */
+    async play() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        // First play per session: click the play button to establish the user
+        // gesture the AudioContext needs. Slow (~3s in headless) but only once.
+        const firstPlay = !this.hasEstablishedGesture;
+        let usedKeyboardFallback = false;
+        if (firstPlay) {
+            try {
+                const playButton = this._page.locator('button[title="play"]').first();
+                await playButton.click({ timeout: 3000 });
+                this.hasEstablishedGesture = true;
+            }
+            catch {
+                usedKeyboardFallback = true;
+                await this._page.keyboard.press('ControlOrMeta+Enter');
+            }
+        }
+        else {
+            // AudioContext is already resumed, so drive strudelMirror directly.
+            // Ctrl+Enter is a CodeMirror keymap binding and only fires when the
+            // editor holds focus — see the comment on stop() (#218).
+            await this._page.evaluate(/* istanbul ignore next */ () => {
+                window.strudelMirror?.evaluate?.();
+            });
+        }
+        // The first play of a session pays for cold caches: the AudioContext
+        // resuming, and every sample the pattern names being fetched before
+        // a cycle can be scheduled. Measured, the first play sat right on a
+        // 3000ms budget — a corpus example failed at 3128ms while the one
+        // that followed it succeeded in 4008ms, so the margin was under a
+        // second either way and the first test to play went red about one
+        // run in five (#416). Later plays reuse everything and stay fast.
+        const startBudgetMs = firstPlay
+            ? this.playbackBudget.firstPlayMs
+            : this.playbackBudget.subsequentPlayMs;
+        if (!(await this.waitForPlaybackState(true, startBudgetMs))) {
+            const state = await this.readPlaybackState();
+            this.isPlaying = state === 'playing';
+            this.analyzer.clearCache();
+            // Name the cause we actually observed. This used to blame a syntax
+            // error for every startup failure, including a page that had gone
+            // away and an AudioContext that never resumed — confident about one
+            // cause when three were possible.
+            //
+            // The gesture-click fallback is a fourth: when the transport button
+            // could not be clicked we pressed Ctrl+Enter instead, which only
+            // reaches CodeMirror while the editor holds focus. That case used
+            // to be reported as a possible syntax error, sending the reader to
+            // look for a bug that is not in their pattern.
+            throw new Error(state === 'unreadable'
+                ? 'Playback did not start: the page could not be read. It may have ' +
+                    'navigated or closed — run init to recover.'
+                : usedKeyboardFallback
+                    ? 'Playback did not start: the transport button could not be clicked, ' +
+                        'so the keyboard fallback was used and the AudioContext may never ' +
+                        'have resumed. Run init to recover; the pattern is probably fine.'
+                    : `Playback did not start within ${String(startBudgetMs)}ms. The pattern ` +
+                        'may have a syntax error, or the AudioContext may not have resumed — ' +
+                        'check diagnostics({ level: "errors" }).');
+        }
+        this.isPlaying = true;
+        // Playback state just changed, so any cached analysis describes the
+        // previous state. Without this, analyze() can report the old state for
+        // up to ANALYSIS_CACHE_TTL after play/stop (#211).
+        this.analyzer.clearCache();
+        return 'Playing';
+    }
+    /**
+     * Halts playback without resetting the cycle position.
+     *
+     * `playback({ action: "pause" })` claimed this for months and did not
+     * do it — `pause` fell through to `stop` (#406). Strudel's scheduler
+     * distinguishes them: `stop()` zeroes the phase counters, `pause()`
+     * only halts the clock. Measured against live strudel.cc:
+     *
+     *   playing              started:true  lastEnd:1.35 phase:5.302
+     *   paused               started:false lastEnd:1.35 phase:5.302
+     *   play() after pause   started:true  lastEnd:2.50 phase:7.602
+     *   stopped              started:false lastEnd:0    phase:0
+     *
+     * So `play()` resumes rather than restarting, and needs no change.
+     *
+     * Tempo history is deliberately NOT cleared here, unlike `stop()`. A
+     * pause is a gap in one performance, and the onsets either side of it
+     * belong to the same pattern — but the gap itself would read as a
+     * silence, so the analyzer drops history across one longer than a bar
+     * on its own (#366). Clearing on top of that would throw away a
+     * reading that is about to be valid again.
+     *
+     * @returns Success message
+     * @throws {Error} When not initialized, or when playback fails to pause
+     */
+    async pause() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        try {
+            await this._page.evaluate(/* istanbul ignore next */ () => {
+                window.strudelMirror?.repl?.pause?.();
+            });
+        }
+        catch {
+            // Same reasoning as stop(): the state check below is what decides
+            // whether this worked, and it produces a better message (#278).
+        }
+        if (!(await this.waitForPlaybackState(false, 2000))) {
+            const state = await this.readPlaybackState();
+            this.isPlaying = state === 'playing';
+            this.analyzer.clearCache();
+            throw new Error(state === 'unreadable'
+                ? 'Failed to pause playback: the page could not be read, so whether ' +
+                    'audio is still running is unknown. Run init to recover.'
+                : 'Failed to pause playback: Strudel scheduler is still running. ' +
+                    'Use playback({ action: "stop" }) to end playback outright.');
+        }
+        this.isPlaying = false;
+        // See play(): a stale cached analysis would report audio still
+        // playing immediately after a successful pause (#211).
+        this.analyzer.clearCache();
+        return 'Paused';
+    }
+    /**
+     * Stops the currently playing pattern
+     * @returns Success message
+     * @throws {Error} When not initialized, or when playback fails to stop
+     */
+    async stop() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        // Drive strudelMirror.stop() directly. Ctrl+Period is bound in the
+        // CodeMirror keymap, so page.keyboard.press only reaches it while the
+        // editor holds focus — and it RESOLVES either way, so the old catch
+        // block never fired and stop() reported success while audio kept
+        // playing (#218). Verified against live strudel.cc: after a keyboard
+        // stop without focus, repl.state.started stayed true; after
+        // strudelMirror.stop() it went false.
+        try {
+            await this._page.evaluate(/* istanbul ignore next */ () => {
+                window.strudelMirror?.stop?.();
+            });
+        }
+        catch {
+            // Fall through rather than surfacing a raw Playwright error. The
+            // state check below establishes whether the page is readable at all
+            // and produces a message that says what to do about it (#278).
+        }
+        if (!(await this.waitForPlaybackState(false, 2000))) {
+            // Fall back to the transport button. Note the title flips to "stop"
+            // while playing, so the old `button[title="play"]` locator could not
+            // have matched here either.
+            try {
+                await this._page.locator('button[title="stop"]').first().click({ timeout: 2000 });
+            }
+            catch {
+                await this._page.keyboard.press('ControlOrMeta+Period');
+            }
+            if (!(await this.waitForPlaybackState(false, 2000))) {
+                const state = await this.readPlaybackState();
+                this.isPlaying = state === 'playing';
+                this.analyzer.clearCache();
+                // An unreadable page is not a successful stop. Saying "Stopped"
+                // here is exactly what #218 was filed for.
+                throw new Error(state === 'unreadable'
+                    ? 'Failed to stop playback: the page could not be read, so whether ' +
+                        'audio is still running is unknown. Run init to recover.'
+                    : 'Failed to stop playback: Strudel scheduler is still running.');
+            }
+        }
+        this.isPlaying = false;
+        // See play(): a stale cached analysis would report audio still playing
+        // immediately after a successful stop (#211).
+        this.analyzer.clearCache();
+        // Onsets from before a stop belong to a finished performance. Kept,
+        // they put a multi-second silence in the middle of the next tempo
+        // reading's intervals (#366).
+        await this.analyzer.resetTempoHistory(this._page);
+        return 'Stopped';
+    }
+    /**
+     * Waits for audio analyzer to connect
+     * @param timeoutMs - Maximum time to wait (default 5000ms)
+     * @returns True if connected, false if timeout
+     */
+    async waitForAudioConnection(timeoutMs = 5000) {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        const startTime = Date.now();
+        while (Date.now() - startTime < timeoutMs) {
+            const isConnected = await this._page.evaluate(/* istanbul ignore next */ () => {
+                return window.strudelAudioAnalyzer?.isConnected || false;
+            });
+            if (isConnected) {
+                return true;
+            }
+            await this._page.waitForTimeout(100);
+        }
+        return false;
+    }
+    /**
+     * Analyzes the current audio output
+     * @returns Audio analysis data including frequency features
+     * @throws {Error} When not initialized
+     */
+    async analyzeAudio() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        return await this.analyzer.getAnalysis(this._page);
+    }
+    /**
+     * Detects the musical key of the currently playing audio
+     * @returns Key analysis including key, scale/mode, and confidence
+     * @throws {Error} When not initialized or analyzer not connected
+     */
+    async detectKey() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        return await this.analyzer.detectKey(this._page);
+    }
+    /**
+     * Detects the tempo (BPM) of the currently playing audio
+     * @returns Tempo analysis including BPM, confidence, and detection method
+     * @throws {Error} When not initialized or analyzer not connected
+     */
+    async detectTempo() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        return await this.analyzer.detectTempo(this._page);
+    }
+    /**
+     * Analyzes the rhythm pattern of the currently playing audio
+     * @returns Rhythm analysis including density, complexity, syncopation, regularity
+     * @throws {Error} When not initialized
+     */
+    async analyzeRhythm() {
+        if (!this._page)
+            throw new Error('Browser not initialized. Run init tool first.');
+        return await this.analyzer.analyzeRhythm(this._page);
+    }
+    /**
+     * Cleans up browser resources and closes the connection
+     * @returns Promise that resolves when cleanup is complete
+     * @example
+     * const controller = new StrudelController();
+     * await controller.initialize();
+     * // ... use controller ...
+     * await controller.cleanup();
+     */
+    async cleanup() {
+        if (this.browser) {
+            // Clear cache
+            this.editorCache = '';
+            this.cacheTimestamp = 0;
+            // Reset gesture flag so a new session re-establishes the user gesture
+            this.hasEstablishedGesture = false;
+            this.isPlaying = false;
+            // Close browser properly
+            await this.browser.close();
+            this.browser = null;
+            this._page = null;
+            // The next page gets its own listener (#488).
+            this.consoleMonitoredPage = null;
+        }
+    }
+    /**
+     * Invalidates the editor content cache
+     * Forces next getCurrentPattern() call to fetch fresh content from browser
+     * @example
+     * controller.invalidateCache();
+     * const pattern = await controller.getCurrentPattern(); // Fetches from browser
+     */
+    invalidateCache() {
+        this.editorCache = '';
+        this.cacheTimestamp = 0;
+    }
+    /**
+     * Validates a pattern before writing it
+     * @param pattern - Pattern to validate
+     * @param autoFix - Automatically fix common errors
+     * @returns Validation result
+     */
+    async validatePattern(pattern, autoFix = false) {
+        this.logger.debug('Validating pattern', { length: pattern.length });
+        const result = this.validator.validate(pattern);
+        if (!result.valid && autoFix) {
+            const { pattern: fixedPattern, fixes } = this.validator.autoFix(pattern);
+            if (fixes.length > 0) {
+                this.logger.info('Auto-fixed pattern errors', { fixes });
+                // Re-validate the fixed pattern
+                const newResult = this.validator.validate(fixedPattern);
+                return {
+                    ...newResult,
+                    suggestions: [...newResult.suggestions, ...fixes]
+                };
+            }
+        }
+        return result;
+    }
+    /**
+     * Writes pattern with validation
+     * @param pattern - Pattern to write
+     * @param options - Write options
+     * @returns Write result with validation info
+     */
+    async writePatternWithValidation(pattern, options = {}) {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        // Validate unless skipped
+        if (!options.skipValidation) {
+            const validation = await this.validatePattern(pattern, options.autoFix);
+            if (!validation.valid) {
+                this.logger.warn('Pattern validation failed', {
+                    errors: validation.errors,
+                    warnings: validation.warnings
+                });
+                // If auto-fix is enabled, try to fix and re-validate
+                if (options.autoFix) {
+                    const { pattern: fixedPattern } = this.validator.autoFix(pattern);
+                    pattern = fixedPattern;
+                }
+                else {
+                    return {
+                        result: `Validation failed: ${validation.errors.join(', ')}`,
+                        validation
+                    };
+                }
+            }
+            if (validation.warnings.length > 0) {
+                this.logger.info('Pattern warnings', { warnings: validation.warnings });
+            }
+        }
+        // Write with error recovery
+        const writeResult = await this.errorRecovery.handlePatternWrite(async (p) => this.writePattern(p), pattern);
+        return { result: writeResult };
+    }
+    /**
+     * Gets current playback state
+     * @returns True if playing, false otherwise
+     */
+    getPlaybackState() {
+        return this.isPlaying;
+    }
+    /**
+     * Appends code to current pattern safely
+     * @param code - Code to append
+     * @returns Result message
+     */
+    async appendPattern(code) {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        const current = await this.getCurrentPattern();
+        const newPattern = current + '\n' + code;
+        return this.writePattern(newPattern);
+    }
+    /**
+     * Inserts code at specific line
+     * @param line - Line number (0-indexed)
+     * @param code - Code to insert
+     * @returns Result message
+     */
+    async insertAtLine(line, code) {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        const current = await this.getCurrentPattern();
+        const lines = current.split('\n');
+        if (line < 0 || line > lines.length) {
+            throw new Error(`Invalid line number: ${line}. Must be between 0 and ${lines.length}`);
+        }
+        lines.splice(line, 0, code);
+        return this.writePattern(lines.join('\n'));
+    }
+    /**
+     * Escapes special regex characters in a string for safe use in RegExp
+     * @nist si-10 "Input validation"
+     * @param str - String to escape
+     * @returns Escaped string safe for RegExp
+     */
+    escapeRegex(str) {
+        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    /**
+     * Replaces text in pattern
+     * @param search - Text to find (literal string, not regex)
+     * @param replace - Replacement text
+     * @returns Result message
+     * @throws {Error} When browser not initialized
+     */
+    async replaceInPattern(search, replace) {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        const current = await this.getCurrentPattern();
+        // Both sides literal.
+        //
+        // The search was escaped and the REPLACEMENT was not, so
+        // `String.replace` interpreted its special patterns. Measured:
+        //
+        //   replaceInPattern('bd', '$&x')   -> "bdx"    wanted "$&x"
+        //   replaceInPattern('bd', 'a$`b')  -> "ab"     wanted "a$`b"
+        //   replaceInPattern('bd', 'x$$y')  -> "x$y"    wanted "x$$y"
+        //
+        // The comment above the escape said it was there "to prevent
+        // injection", which is exactly half of the job it was doing.
+        // A replacer function is passed the match and its return value is
+        // used verbatim, so nothing in `replace` is interpreted (#488).
+        const escaped = this.escapeRegex(search);
+        const newPattern = current.replace(new RegExp(escaped, 'g'), () => replace);
+        if (current === newPattern) {
+            return `No matches found for: ${search}`;
+        }
+        return this.writePattern(newPattern);
+    }
+    /**
+     * Gets pattern statistics
+     * @returns Pattern statistics
+     */
+    async getPatternStats() {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        const pattern = await this.getCurrentPattern();
+        const lines = pattern.split('\n');
+        return {
+            lines: lines.length,
+            chars: pattern.length,
+            sounds: (pattern.match(/s\(/g) || []).length,
+            notes: (pattern.match(/note\(/g) || []).length,
+            effects: (pattern.match(/\.(room|delay|reverb|lpf|hpf|bpf)\(/g) || []).length,
+            functions: (pattern.match(/\b(stack|every|sometimes|rarely|often|fast|slow)\(/g) || []).length
+        };
+    }
+    /**
+     * Takes a snapshot of the current editor state
+     * @returns Snapshot data
+     */
+    async takeSnapshot() {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        const pattern = await this.getCurrentPattern();
+        const stats = await this.getPatternStats();
+        return {
+            pattern,
+            timestamp: new Date().toISOString(),
+            isPlaying: this.isPlaying,
+            stats
+        };
+    }
+    // SECURITY: executeInStrudelContext was removed in issue #56
+    // It used new Function() which is equivalent to eval() and poses injection risks.
+    // Pattern execution should go through writePattern() + play() which is the safe path.
+    /**
+     * Gets console errors captured since last clear
+     * @returns Array of error messages from Strudel
+     */
+    getConsoleErrors() {
+        return [...this.consoleErrors];
+    }
+    /**
+     * Gets console warnings captured since last clear
+     * @returns Array of warning messages from Strudel
+     */
+    getConsoleWarnings() {
+        return [...this.consoleWarnings];
+    }
+    /**
+     * Clears captured console errors and warnings
+     */
+    clearConsoleMessages() {
+        this.consoleErrors = [];
+        this.consoleWarnings = [];
+    }
+    /**
+     * Validates pattern with runtime checking
+     * Writes pattern, briefly plays to trigger evaluation, then captures errors
+     * @param pattern - Pattern to validate
+     * @param waitMs - How long to wait for errors (default 500ms)
+     * @returns Validation result with runtime errors
+     */
+    async validatePatternRuntime(pattern, waitMs = 500) {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        // Clear previous errors
+        this.clearConsoleMessages();
+        // Write pattern
+        await this.writePattern(pattern);
+        // Brief play to trigger evaluation - Strudel uses lazy evaluation
+        // so errors only appear when the pattern is actually executed
+        try {
+            await this._page.keyboard.press('ControlOrMeta+Enter');
+            await this._page.waitForTimeout(Math.min(waitMs, 300));
+            await this._page.keyboard.press('ControlOrMeta+Period');
+        }
+        catch (e) {
+            this.logger.warn('Failed to trigger pattern evaluation', e);
+        }
+        // Wait for potential errors to appear
+        await this._page.waitForTimeout(waitMs);
+        const errors = this.getConsoleErrors();
+        const warnings = this.getConsoleWarnings();
+        return {
+            valid: errors.length === 0,
+            errors,
+            warnings
+        };
+    }
+    /**
+     * Gets the current page instance
+     * @returns Page instance or null if not initialized
+     */
+    get page() {
+        return this._page;
+    }
+    /**
+     * Brings the browser window to the foreground
+     * @returns Success message
+     * @throws {Error} When browser not initialized
+     */
+    async showBrowser() {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        try {
+            await this._page.bringToFront();
+            return 'Browser window brought to foreground';
+        }
+        catch (error) {
+            this.logger.error('Failed to show browser', error);
+            throw new Error(`Failed to show browser: ${error.message}`);
+        }
+    }
+    /**
+     * Takes a screenshot of the current browser state
+     * Screenshots are saved to the tmp/ directory by default
+     * @param filename - Optional filename for the screenshot (saved in tmp/ if no path specified)
+     * @returns Path to saved screenshot
+     * @throws {Error} When browser not initialized
+     */
+    async takeScreenshot(filename) {
+        if (!this._page) {
+            throw new Error('Browser not initialized. Run init tool first.');
+        }
+        try {
+            // Confine to tmp/. The old guard was inverted — it passed any
+            // filename *containing* a separator through unsanitized, which is
+            // exactly what a traversal payload looks like (#234).
+            const tmpDir = path.join(process.cwd(), 'tmp');
+            await fs.mkdir(tmpDir, { recursive: true });
+            const target = resolveSafeOutputPath(filename, {
+                directory: tmpDir,
+                extension: '.png',
+                defaultName: `strudel-screenshot-${Date.now()}.png`,
+            });
+            await this._page.screenshot({ path: target.path, fullPage: false });
+            return target.wasModified
+                ? `Screenshot saved to ${target.path} (requested name '${String(target.requested)}' was not usable)`
+                : `Screenshot saved to ${target.path}`;
+        }
+        catch (error) {
+            this.logger.error('Failed to take screenshot', error);
+            throw new Error(`Failed to take screenshot: ${error.message}`);
+        }
+    }
+    /**
+     * Gets current browser and playback status
+     * @returns Status object with initialization and playback state
+     */
+    getStatus() {
+        return {
+            // `isAlive()`, not "a page object exists". A user closing the
+            // visible browser window — the documented default is headless
+            // false — left this reporting `initialized: true` for a page that
+            // was gone (#456).
+            initialized: this.isAlive(),
+            // Cached: set by play/pause/stop and NOT reconciled with the page,
+            // so it is stale if playback changed outside this controller (the
+            // user pressing stop in the window). `readPlaybackState()` asks
+            // the page; this field is a last-known value and is named as such
+            // in the returned object.
+            playing: this.isPlaying,
+            patternLength: this.editorCache.length,
+            cacheValid: this.editorCache.length > 0 && (Date.now() - this.cacheTimestamp) < this.CACHE_TTL,
+            errorCount: this.consoleErrors.length,
+            warningCount: this.consoleWarnings.length
+        };
+    }
+    /**
+     * Gets detailed browser diagnostics
+     * @returns Diagnostic information
+     */
+    async getDiagnostics() {
+        const diagnostics = {
+            // Connectivity, not existence.
+            //
+            // These were `this.browser !== null` and `this._page !== null`, so
+            // closing the browser out from under the controller left
+            // diagnostics reporting a connected browser and a loaded page.
+            // `isAlive()` two hundred lines up already asks `isClosed()`; the
+            // tool whose entire job is reporting system state was the one
+            // place that did not (#488).
+            //
+            // Note `browser` is deliberately null for session-managed
+            // controllers, which do not own it — so this reads false there,
+            // as it did before. That is a separate reporting gap, filed
+            // rather than papered over here.
+            browserConnected: this.browser?.isConnected() ?? false,
+            pageLoaded: this._page !== null && !this._page.isClosed(),
+            editorReady: false,
+            audioConnected: false,
+            cacheStatus: {
+                hasCache: this.editorCache.length > 0,
+                cacheAge: this.cacheTimestamp > 0 ? Date.now() - this.cacheTimestamp : 0
+            },
+            errorStats: this.errorRecovery.getErrorStats()
+        };
+        if (this._page) {
+            try {
+                // Check that strudelMirror API is available
+                diagnostics.editorReady = await this._page.evaluate(/* istanbul ignore next */ () => {
+                    const sm = window.strudelMirror;
+                    return sm?.editor?.dispatch !== undefined;
+                });
+                diagnostics.audioConnected = await this._page.evaluate(/* istanbul ignore next */ () => {
+                    return window.strudelAudioAnalyzer?.isConnected || false;
+                });
+            }
+            catch (error) {
+                this.logger.warn('Failed to get diagnostics', error);
+            }
+        }
+        return diagnostics;
+    }
+}

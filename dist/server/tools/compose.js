@@ -1,0 +1,145 @@
+/**
+ * compose domain — high-level UX tools that aren't a thin verb on a
+ * subsystem: `compose` (one-shot generate+write+play) and
+ * `browser_window` (show or screenshot the Strudel window).
+ */
+import { InputValidator } from '../../utils/InputValidator.js';
+import { defaultTempoFor, resolveLayers } from '../../services/StyleRegistry.js';
+const SESSION_ID_PROP = {
+    session_id: {
+        type: 'string',
+        description: 'Optional session ID (#108). Omit to use default session. compose auto-init only applies to default session — named sessions must already exist.',
+    },
+};
+export const tools = [
+    {
+        name: 'browser_window',
+        description: 'Interact with the visible Strudel browser window. ' +
+            'action=show brings the window to the foreground. ' +
+            'action=screenshot captures the current editor view to disk (optional `filename`). ' +
+            'Example: browser_window({ action: "screenshot", filename: "demo.png" }). ' +
+            'For diagnostics (status/errors/perf) use diagnostics; for the editor itself use edit_pattern.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                action: { type: 'string', enum: ['show', 'screenshot'], description: 'Window action' },
+                filename: { type: 'string', description: 'action=screenshot: optional output filename' },
+                ...SESSION_ID_PROP,
+            },
+            required: ['action'],
+        },
+    },
+    {
+        name: 'compose',
+        description: 'Generate, write, and play a complete pattern in one step. Auto-initializes default browser if needed.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                style: { type: 'string', description: 'Genre: techno, house, dnb, breakbeat, trap, jungle, ambient, experimental, intelligent_dnb, trip_hop, boom_bap. Anything else (jazz included) gets techno drums, and the response says so.' },
+                tempo: { type: 'number', description: 'BPM (default: genre-appropriate)' },
+                key: { type: 'string', description: 'Musical key (default: C)' },
+                auto_play: { type: 'boolean', description: 'Start playback immediately (default: true)' },
+                get_feedback: { type: 'boolean', description: 'Get AI feedback on the generated pattern (default: false)' },
+                ...SESSION_ID_PROP,
+            },
+            required: ['style'],
+        },
+    },
+];
+export const toolNames = new Set(tools.map(t => t.name));
+async function doShow(ctx, sid) {
+    if (!sid && !ctx.isInitialized()) {
+        return 'Browser not initialized. Run init first.';
+    }
+    return await ctx.getController(sid).showBrowser();
+}
+async function doScreenshot(args, ctx, sid) {
+    if (!sid && !ctx.isInitialized()) {
+        return 'Browser not initialized. Run init first.';
+    }
+    return await ctx.getController(sid).takeScreenshot(args?.filename);
+}
+export async function execute(name, args, ctx) {
+    const sid = args?.session_id;
+    switch (name) {
+        case 'browser_window': {
+            const a = args?.action;
+            if (a !== 'show' && a !== 'screenshot') {
+                throw new Error(`Invalid action: ${a}. Must be one of: show, screenshot`);
+            }
+            return a === 'show' ? await doShow(ctx, sid) : await doScreenshot(args, ctx, sid);
+        }
+        case 'compose': {
+            InputValidator.validateStringLength(args.style, 'style', 100, false);
+            if (args.key) {
+                InputValidator.validateRootNote(args.key);
+            }
+            if (args.tempo !== undefined) {
+                InputValidator.validateBPM(args.tempo);
+            }
+            // Auto-init only the default session. Named sessions must be
+            // created via `session({ action: "create" })` first — ctx.getController(sid)
+            // throws if missing, which the dispatcher renders as err('business').
+            if (!sid) {
+                await ctx.ensureInitialized();
+            }
+            const controller = ctx.getController(sid);
+            // compose assembles four independently-resolved layers, each
+            // falling back on its own. One `style` field cannot describe that
+            // — reporting only the drum resolution called
+            // compose({style:'jazz'}) "techno" while its bassline, Dorian
+            // scale and jazz chords were all genuinely jazz, and let
+            // `breakbeat` claim itself supported over a techno bassline
+            // (#294, correcting #279).
+            const resolution = resolveLayers(args.style);
+            const tempo = args.tempo || defaultTempoFor(args.style);
+            const key = args.key || 'C';
+            const pattern = ctx.generator.generateCompletePattern(args.style, key, tempo);
+            await controller.writePattern(pattern);
+            const shouldPlay = args.auto_play !== false;
+            if (shouldPlay) {
+                await controller.play();
+            }
+            const response = {
+                success: true,
+                pattern: pattern.substring(0, 200) + (pattern.length > 200 ? '...' : ''),
+                metadata: {
+                    style: args.style,
+                    bpm: tempo,
+                    key,
+                    layers: resolution.layers,
+                    substituted: resolution.substituted,
+                },
+                status: shouldPlay ? 'playing' : 'ready',
+                message: resolution.substituted.length === 0
+                    ? `Created ${args.style} pattern in ${key}${shouldPlay ? ' - now playing' : ''}`
+                    : `Created pattern in ${key}${shouldPlay ? ' - now playing' : ''}. ` +
+                        `No ${resolution.substituted.join(' or ')} defined for style "${args.style}" — ` +
+                        resolution.substituted
+                            .map(l => `${l}: ${resolution.layers[l]}`)
+                            .join(', ') + '.',
+            };
+            if (args.get_feedback) {
+                if (ctx.geminiService.isAvailable()) {
+                    try {
+                        const feedback = await ctx.geminiService.getCreativeFeedback(pattern);
+                        response.feedback = feedback;
+                        response.message += ` (AI feedback: ${feedback.complexity} complexity, estimated ${feedback.estimatedStyle})`;
+                    }
+                    catch (error) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        ctx.logger.warn('Failed to get AI feedback for compose', { error: message });
+                        response.message += ' (AI feedback unavailable)';
+                    }
+                }
+                else {
+                    response.message += ' (AI feedback requires GEMINI_API_KEY)';
+                }
+            }
+            return response;
+        }
+        default:
+            throw new Error(`compose module does not handle tool: ${name}`);
+    }
+}
+export const composeModule = { tools, toolNames, execute };

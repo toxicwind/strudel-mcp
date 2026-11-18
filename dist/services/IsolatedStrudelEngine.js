@@ -1,0 +1,135 @@
+/**
+ * `LocalPatternEngine` backed by a forked child with a heap cap and a
+ * deadline (#307).
+ *
+ * Before this, `validate_pattern_local`, `analyze_pattern_local`,
+ * `query_pattern_events` and `transpile_pattern` each evaluated user code
+ * in the MCP server's own process. The AST allowlist in `PatternSandbox`
+ * stops the code doing anything *interesting*, but it cannot stop it doing
+ * something *large*: `new Array(5e7).fill(7)` is allowlist-clean and kills
+ * the server, taking every session's browser state with it.
+ *
+ * One runner sits under all four tools rather than three isolation paths,
+ * which was the point of the fix. It is lazy — a session that never touches
+ * a local-engine tool never forks anything.
+ */
+import { IsolatedEngineRunner, IsolatedRunnerError } from './IsolatedEngineRunner.js';
+/**
+ * V8 old-space cap for the child. Comfortably above what a legitimate
+ * pattern needs (the engine already refuses to materialize more than
+ * 50,000 events) and far below what would trouble the host.
+ */
+export const DEFAULT_ENGINE_HEAP_MB = 256;
+/** Wall-clock deadline for one evaluation. Covers hangs the heap cap cannot. */
+export const DEFAULT_ENGINE_TIMEOUT_MS = 5000;
+export class IsolatedStrudelEngine {
+    options;
+    runner = null;
+    starting = null;
+    /**
+     * Permanent, not a flag that a later start can clear. Resolving the
+     * child entrypoint is asynchronous, so `dispose()` can land while a
+     * start is in flight — and without this the start finished afterwards,
+     * assigned a fresh runner and forked a child AFTER shutdown. A process
+     * spawned by a disposed engine has nobody left to kill it.
+     */
+    disposed = false;
+    constructor(options = {}) {
+        this.options = options;
+    }
+    /** True once a child has been forked. Diagnostics and tests. */
+    get isStarted() {
+        return this.runner !== null;
+    }
+    async transpile(code) {
+        return this.call('transpile', [code]);
+    }
+    async validate(code) {
+        return this.call('validate', [code]);
+    }
+    async analyzePattern(code) {
+        return this.call('analyzePattern', [code]);
+    }
+    async queryEvents(code, start, end) {
+        return this.call('queryEvents', [code, start, end]);
+    }
+    /**
+     * Stops the child permanently. Safe to call when none was ever started,
+     * and safe to call while one is starting.
+     */
+    dispose() {
+        this.disposed = true;
+        this.runner?.dispose();
+        this.runner = null;
+        this.starting = null;
+    }
+    async call(method, args) {
+        const runner = await this.getRunner();
+        return runner.call(method, args);
+    }
+    async getRunner() {
+        if (this.disposed) {
+            throw new IsolatedRunnerError('Isolated pattern engine has been disposed.', 'crash');
+        }
+        if (this.runner !== null)
+            return this.runner;
+        // Single-flight: four concurrent tool calls on a cold engine must
+        // resolve the entrypoint once, not four times.
+        this.starting ??= this.startRunner();
+        try {
+            const runner = await this.starting;
+            // Re-checked AFTER the await, not just before it. dispose() may
+            // have run during the entrypoint resolution, and a runner handed
+            // back at that point would fork a child nobody owns.
+            if (this.disposed) {
+                runner.dispose();
+                throw new IsolatedRunnerError('Isolated pattern engine has been disposed.', 'crash');
+            }
+            return runner;
+        }
+        finally {
+            this.starting = null;
+        }
+    }
+    async startRunner() {
+        let childPath = this.options.childPath;
+        let extraExecArgv = this.options.extraExecArgv ?? [];
+        if (childPath === undefined) {
+            // Dynamic, and only on the production path: the module it loads uses
+            // `import.meta`, which cannot be parsed by this project's Jest.
+            // See engineChildPath.ts for why that is not negotiable.
+            try {
+                const resolve = this.options.resolveEntrypoint ??
+                    (async () => {
+                        const { resolveChildEntrypoint } = await import('./engineChildPath.js');
+                        return resolveChildEntrypoint();
+                    });
+                const entrypoint = await resolve();
+                childPath = entrypoint.childPath;
+                if (entrypoint.needsTsx)
+                    extraExecArgv = ['--import', 'tsx', ...extraExecArgv];
+            }
+            catch (error) {
+                if (error instanceof IsolatedRunnerError)
+                    throw error;
+                const detail = error instanceof Error ? error.message : String(error);
+                throw new IsolatedRunnerError(`Could not locate the isolated pattern engine child: ${detail}`, 'spawn');
+            }
+        }
+        const runner = new IsolatedEngineRunner({
+            childPath,
+            extraExecArgv,
+            maxOldSpaceMb: this.options.maxOldSpaceMb ?? DEFAULT_ENGINE_HEAP_MB,
+            timeoutMs: this.options.timeoutMs ?? DEFAULT_ENGINE_TIMEOUT_MS,
+            onSpawn: this.options.onSpawn,
+        });
+        // Assigned only if we are still alive. Storing it first would leave
+        // dispose() with nothing to find and this method with a live handle.
+        if (this.disposed) {
+            runner.dispose();
+            throw new IsolatedRunnerError('Isolated pattern engine has been disposed.', 'crash');
+        }
+        this.runner = runner;
+        return runner;
+    }
+}
